@@ -1,0 +1,329 @@
+# =============================================================================
+#  SDR-Voxel R-CNN —— 改进模型配置
+#  Sparse-input · Density-gated encoding · Riemannian distillation
+#
+#  三个创新点落点：
+#    ③ EIP-BS  数据侧：本配置的 DATA_CONFIG 指向 kitti_dataset_sdr.yaml，
+#              其中额外启用 eip_bs_voxelize，产出学生分支的 16 线点云
+#    ① MS-DGE  网络侧：MODEL.VFE.NAME = MSDGE（替换基线的 MeanVFE）
+#    ② CG-RD   训练侧：MODEL.KD + MODEL.TEACHER（教师看稠密、学生看稀疏）
+#
+#  训练命令：
+#    python tools/train.py --preset baseline     # 基线 Voxel R-CNN
+#    python tools/train.py --preset sdr          # 改进模型 SDR-Voxel R-CNN
+#  或显式指定：
+#    python tools/train.py --cfg_file tools/cfgs/kitti_models/voxel_rcnn_car.yaml
+#    python tools/train.py --cfg_file tools/cfgs/kitti_models/sdr_voxel_rcnn_car.yaml
+# =============================================================================
+
+CLASS_NAMES: ['Car']
+
+DATA_CONFIG:
+    # 注意：这里指向的是 sdr 专用数据配置（含 EIP-BS 处理器），
+    # 基线的 kitti_dataset.yaml 保持原样，两者互不影响。
+    _BASE_CONFIG_: cfgs/dataset_configs/kitti_dataset_sdr.yaml
+    DATA_AUGMENTOR:
+        DISABLE_AUG_LIST: ['placeholder']
+        AUG_CONFIG_LIST:
+            - NAME: gt_sampling
+              USE_ROAD_PLANE: True
+              DB_INFO_PATH:
+                  - kitti_dbinfos_train.pkl
+              PREPARE: {
+                 filter_by_min_points: ['Car:5'],
+                 filter_by_difficulty: [-1],
+              }
+
+              SAMPLE_GROUPS: ['Car:15']
+              NUM_POINT_FEATURES: 4
+              DATABASE_WITH_FAKELIDAR: False
+              REMOVE_EXTRA_WIDTH: [0.0, 0.0, 0.0]
+              LIMIT_WHOLE_SCENE: False
+
+            - NAME: random_world_flip
+              ALONG_AXIS_LIST: ['x']
+
+            - NAME: random_world_rotation
+              WORLD_ROT_ANGLE: [-0.78539816, 0.78539816]
+
+            - NAME: random_world_scaling
+              WORLD_SCALE_RANGE: [0.95, 1.05]
+
+MODEL:
+    NAME: SDRVoxelRCNN
+
+    # ------------------------- 创新点① MS-DGE -------------------------
+    # 多尺度密度门控体素编码，原位替换 MeanVFE。
+    # 输出通道即 3D 稀疏骨干的输入通道（OUTPUT_CHANNELS: 64）。
+    VFE:
+        NAME: MSDGE
+        USE_NORM: True
+        USE_ABSOLUTE_XYZ: True
+        WITH_DISTANCE: False
+        NUM_BASE_FILTERS: [128]
+        # 相对基础体素 (0.05m) 的 xy 尺度倍率，须递增。四档的意义：
+        #   [1, 8, 16, 32] -> 0.05(原生恒等) / 0.4 / 0.8 / 1.6 m   ← 默认
+        #   [8, 16, 32]    ->            0.4 / 0.8 / 1.6 m
+        # 文档的 Pillar 口径是"0.4m 基础 × [1,2,4]"，本仓库基础体素是 0.05m，
+        # 倍率必须 ×8 才是同一组绝对尺度。但**必须保留 factor=1 的恒等分支**：
+        # 三个尺度都池化的话，0.05~0.4m 的细节被完全均值掉，3D 骨干的
+        # stride-1/2/4（0.05/0.1/0.2m）与 ROI 的 x_conv2 池化就都拿不到细节了。
+        SCALE_FACTORS: [1, 8, 16, 32]
+        SCALE_CHANNELS: 128
+        OUTPUT_CHANNELS: 64
+        GATE_HIDDEN_CHANNELS: 64
+        # 精细分支走残差 + 该分支 BN 权重零初始化 => 初始化时精细分支**严格等于**
+        # 基础 PFN 特征（不是被随机线性层重新混合后的特征），改进项在 step 0
+        # 不破坏基线行为。关掉（False）就是"纯变换"口径。
+        FINE_RESIDUAL: True
+        # 密度/距离先验经一个零初始化线性层直连 softmax 逻辑值（FiLM 式旁路）。
+        # 关掉后先验只能通过 512 维特征拼接 + 64 维隐层间接影响门控，
+        # 信噪比被淹没（这是"密度门控没学到东西"的常见原因）。
+        GATE_PRIOR_DIRECT: True
+        # 先验消融：full / no_count（去掉逐体素点数）/ count_only（去掉粗尺度点数）/ none
+        DENSITY_PRIOR: full
+        # 密度先验的归一化除数用训练集 99 分位的 EMA 估计（替代硬编码 /5、/8）
+        DENSITY_STATS_MOMENTUM: 0.01
+        # 消融项：门控改 argmax 硬切换（one-hot），用来证明"连续软配比"优于"离散硬选"
+        GATE_HARD: False
+        # 距离分箱边界（归一化距离）：配合日志看"各尺度权重随距离怎么变"
+        GATE_DIST_EDGES: [0.25, 0.5]
+
+    # ------------------------- 学生分支（主干） ------------------------
+    BACKBONE_3D:
+        NAME: VoxelBackBone8x
+
+    MAP_TO_BEV:
+        NAME: HeightCompression
+        NUM_BEV_FEATURES: 256
+
+    BACKBONE_2D:
+        NAME: BaseBEVBackbone
+
+        LAYER_NUMS: [5, 5]
+        LAYER_STRIDES: [1, 2]
+        NUM_FILTERS: [64, 128]
+        UPSAMPLE_STRIDES: [1, 2]
+        NUM_UPSAMPLE_FILTERS: [128, 128]
+
+    DENSE_HEAD:
+        NAME: AnchorHeadSingle
+        CLASS_AGNOSTIC: False
+
+        USE_DIRECTION_CLASSIFIER: True
+        DIR_OFFSET: 0.78539
+        DIR_LIMIT_OFFSET: 0.0
+        NUM_DIR_BINS: 2
+
+        ANCHOR_GENERATOR_CONFIG: [
+            {
+                'class_name': 'Car',
+                'anchor_sizes': [[3.9, 1.6, 1.56]],
+                'anchor_rotations': [0, 1.57],
+                'anchor_bottom_heights': [-1.78],
+                'align_center': False,
+                'feature_map_stride': 8,
+                'matched_threshold': 0.6,
+                'unmatched_threshold': 0.45
+            },
+        ]
+
+        TARGET_ASSIGNER_CONFIG:
+            NAME: AxisAlignedTargetAssigner
+            POS_FRACTION: -1.0
+            SAMPLE_SIZE: 512
+            NORM_BY_NUM_EXAMPLES: False
+            MATCH_HEIGHT: False
+            BOX_CODER: ResidualCoder
+
+        LOSS_CONFIG:
+            LOSS_WEIGHTS: {
+                'cls_weight': 1.0,
+                'loc_weight': 2.0,
+                'dir_weight': 0.2,
+                'code_weights': [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+            }
+
+    ROI_HEAD:
+        NAME: VoxelRCNNHead
+        CLASS_AGNOSTIC: True
+
+        SHARED_FC: [256, 256]
+        CLS_FC: [256, 256]
+        REG_FC: [256, 256]
+        DP_RATIO: 0.3
+
+        NMS_CONFIG:
+            TRAIN:
+                NMS_TYPE: nms_gpu
+                MULTI_CLASSES_NMS: False
+                NMS_PRE_MAXSIZE: 9000
+                NMS_POST_MAXSIZE: 512
+                NMS_THRESH: 0.8
+            TEST:
+                NMS_TYPE: nms_gpu
+                MULTI_CLASSES_NMS: False
+                USE_FAST_NMS: False
+                SCORE_THRESH: 0.0
+                NMS_PRE_MAXSIZE: 2048
+                NMS_POST_MAXSIZE: 100
+                NMS_THRESH: 0.7
+
+        ROI_GRID_POOL:
+            FEATURES_SOURCE: ['x_conv2', 'x_conv3', 'x_conv4']
+            PRE_MLP: True
+            GRID_SIZE: 6
+            POOL_LAYERS:
+                x_conv2:
+                    MLPS: [[32, 32]]
+                    QUERY_RANGES: [[4, 4, 4]]
+                    POOL_RADIUS: [0.4]
+                    NSAMPLE: [16]
+                    POOL_METHOD: max_pool
+                x_conv3:
+                    MLPS: [[32, 32]]
+                    QUERY_RANGES: [[4, 4, 4]]
+                    POOL_RADIUS: [0.8]
+                    NSAMPLE: [16]
+                    POOL_METHOD: max_pool
+                x_conv4:
+                    MLPS: [[32, 32]]
+                    QUERY_RANGES: [[4, 4, 4]]
+                    POOL_RADIUS: [1.6]
+                    NSAMPLE: [16]
+                    POOL_METHOD: max_pool
+        TARGET_CONFIG:
+            BOX_CODER: ResidualCoder
+            ROI_PER_IMAGE: 128
+            FG_RATIO: 0.5
+
+            SAMPLE_ROI_BY_EACH_CLASS: True
+            CLS_SCORE_TYPE: roi_iou
+
+            CLS_FG_THRESH: 0.75
+            CLS_BG_THRESH: 0.25
+            CLS_BG_THRESH_LO: 0.1
+            HARD_BG_RATIO: 0.8
+
+            REG_FG_THRESH: 0.55
+
+        LOSS_CONFIG:
+            CLS_LOSS: BinaryCrossEntropy
+            REG_LOSS: smooth-l1
+            CORNER_LOSS_REGULARIZATION: True
+            GRID_3D_IOU_LOSS: False
+            LOSS_WEIGHTS: {
+                'rcnn_cls_weight': 1.0,
+                'rcnn_reg_weight': 1.0,
+                'rcnn_corner_weight': 1.0,
+                'rcnn_iou3d_weight': 1.0,
+                'code_weights': [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+            }
+
+    # ------------------------- 教师分支（冻结） ------------------------
+    # 结构与基线 Voxel R-CNN 的前段完全一致；不含检测头与 ROI 头。
+    # 教师用的是 **OpenPCDet 官方 KITTI Car-only 预训练权重**
+    # （voxel_rcnn_car_84.54.pth，AP_3D moderate 84.54），这正是知识蒸馏的常规做法：
+    # 教师是"现成的强模型"，学生从零学稀疏输入。
+    # 该 ckpt 与本仓库教师逐层对齐，实测 156/156 张量、100% 命中：
+    #   backbone_3d(72) + backbone_2d(84)；vfe=MeanVFE、map_to_bev=HeightCompression
+    #   两者本身无可学习参数，所以 ckpt 里没有它们的键是正常的。
+    # 换权重前先体检：python tools/check_teacher_ckpt.py --ckpt <path> --config <本文件>
+    # 也可以填自己用 --preset baseline 训出来的 ckpt（键名同样一一对应）。
+    TEACHER:
+        FREEZE: True
+        PRETRAINED_PATH: checkpoints/voxel_rcnn_84.54.pth
+        # 例：output/cfgs/kitti_models/voxel_rcnn_car/default/ckpt/checkpoint_epoch_80.pth
+
+        VFE:
+            NAME: MeanVFE
+
+        BACKBONE_3D:
+            NAME: VoxelBackBone8x
+
+        MAP_TO_BEV:
+            NAME: HeightCompression
+            NUM_BEV_FEATURES: 256
+
+        BACKBONE_2D:
+            NAME: BaseBEVBackbone
+            LAYER_NUMS: [5, 5]
+            LAYER_STRIDES: [1, 2]
+            NUM_FILTERS: [64, 128]
+            UPSAMPLE_STRIDES: [1, 2]
+            NUM_UPSAMPLE_FILTERS: [128, 128]
+
+    # ------------------------- 创新点② CG-RD -------------------------
+    KD:
+        ENABLE: True
+        ROI_DILATE: 0.5            # M_roi 的 GT 框外扩量（米）
+        GATE_HIDDEN_CHANNELS: 32   # 曲率门控隐层通道
+        ADAPTER_CHANNELS: null     # null = 自动取教师通道数（256）
+        CELL_WH: null              # null = 由 point_cloud_range / 特征图尺寸自动推导
+        # 曲率门控的归一化方式：
+        #   mean  = ℒ_rod 的分母用 Σ(M_roi·w)，w 的整体缩放不影响损失（默认，防塌缩）
+        #   count = 文档原式 ΣM_roi，可被"把 w 压到 0"平凡解绕过，仅用于对照复现
+        GATE_NORM: mean
+        # 消融项：曲率门控开/关（关掉时 w≡1，ℒ_rod 退化为 M_roi 内的平均距离）。
+        # 这是"门控本身值多少"的对照组，与"换 L2 距离值多少"（DIST_TYPE）正交。
+        CURVATURE_GATE: True
+        # 距离类型：riemann（文档原式）/ cosine（只方向）/ l2n（归一化 L2）/ l2（普通 MSE）
+        # l2n 是 ② 的对照组，用 `--preset sdr_mse` 即可跑，无需改这里
+        DIST_TYPE: riemann
+        # |log r_t − log r_s| 的权重。师生主干不同构（教师 4 通道 MeanVFE、学生 64 通道
+        # MSDGE）时模长量纲不可比，先看日志里的 cgrd_theta_mean / cgrd_logmag_mean：
+        # 若 logmag 比 theta/π 大一个量级，就调到 0.5 甚至 0（或直接用 DIST_TYPE: cosine）
+        RADIAL_WEIGHT: 1.0
+        # 分母下限（格子数）。ROI 覆盖率在 KITTI Car 上只有 2~4%，远车/无标注帧
+        # 会让 Σw 接近 0，除法把噪声放大成尖峰梯度
+        DENOM_FLOOR: 1.0
+        LOSS_WEIGHTS:
+            rod: 1.0               # ℒ_rod  主对齐项（M_roi × 曲率门控 × 黎曼距离）
+            ford: 0.5              # ℒ_ford 前景强制对齐（文档 4 节建议 λ₂=0.5）
+            rho: 0.2               # ℒ_ρ    局部特征能量密度一致性（建议 λ₃=0.2）
+        LOSS_WEIGHT: 1.0           # 蒸馏总权重 λ
+        # 蒸馏权重 ramp-up：前 N 次迭代 λ 从 0 线性升到设定值。训练初期学生特征还是
+        # 随机的，D_rod 的量级由初始化决定、与任务无关，直接用全量 λ 会压过定位梯度。
+        # 0 = 关闭。总迭代数 ≈ (3712/bs)×80，500 次约等于前 1 个 epoch。
+        RAMPUP_ITERS: 500
+
+    POST_PROCESSING:
+        RECALL_THRESH_LIST: [0.3, 0.5, 0.7]
+        SCORE_THRESH: 0.3
+        OUTPUT_RAW_SCORE: False
+
+        EVAL_METRIC: kitti
+
+        EXTRA_METRICS: ['ap50_95', 'prf']
+        PRF_IOU_THRESH: 0.7
+        PRF_DIFFICULTY: 1
+
+        NMS_CONFIG:
+            MULTI_CLASSES_NMS: False
+            NMS_TYPE: nms_gpu
+            NMS_THRESH: 0.1
+            NMS_PRE_MAXSIZE: 4096
+            NMS_POST_MAXSIZE: 500
+
+
+OPTIMIZATION:
+    # 双分支（教师冻结 + 学生）比基线吃显存，2 卡显存不足时改成 1
+    BATCH_SIZE_PER_GPU: 2
+    NUM_EPOCHS: 80
+
+    OPTIMIZER: adam_onecycle
+    LR: 0.01
+    WEIGHT_DECAY: 0.01
+    MOMENTUM: 0.9
+
+    MOMS: [0.95, 0.85]
+    PCT_START: 0.4
+    DIV_FACTOR: 10
+    DECAY_STEP_LIST: [35, 45]
+    LR_DECAY: 0.1
+    LR_CLIP: 0.0000001
+
+    LR_WARMUP: False
+    WARMUP_EPOCH: 1
+
+    GRAD_NORM_CLIP: 10

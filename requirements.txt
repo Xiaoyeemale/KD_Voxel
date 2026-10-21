@@ -1,0 +1,39 @@
+# ===========================================================================
+# KD_Voxel / OpenPCDet 运行依赖
+# 版本策略：只写下限（>=），不锁定具体版本
+# CUDA 要求：>= 10.2（spconv 2.x 官方最低轮子为 cu102，源码编译要求 >= 11.0）
+# ===========================================================================
+
+# ---- 必需：数据处理 / 训练骨架 ----
+numpy>=1.20
+torch>=1.10
+torchvision>=0.11
+scikit-image>=0.19
+numba>=0.53
+pillow>=8.2
+SharedArray>=3.2
+easydict>=1.9
+pyyaml>=5.4
+tqdm>=4.60
+tensorboardX>=2.5
+
+# ---- 可视化 ----
+matplotlib>=3.4
+
+# ---- 稀疏卷积核心：pip 包名随 CUDA 版本变化，取消注释与本机匹配的一行 ----
+# CUDA 10.2 : spconv-cu102
+# CUDA 11.3 : spconv-cu113   (仅 Linux)
+# CUDA 11.4 : spconv-cu114
+# CUDA 11.6 : spconv-cu116
+# CUDA 11.7 : spconv-cu117
+# CUDA 11.8 : spconv-cu118
+# CUDA 12.0 : spconv-cu120
+# spconv-cu118
+
+# ---- 可选：仅在用到对应功能时安装 ----
+# torch_scatter>=2.0.9        # DynMeanVFE / DynamicVoxelVFE 动态体素化
+# open3d>=0.15                # tools/demo.py 可视化（首选，无需 mayavi）
+# mayavi>=4.7                 # tools/demo.py 的旧可视化分支
+# gpustat>=1.0                # 训练日志里打印 GPU 占用
+# tensorflow>=2.6             # 仅 Waymo 数据集评估
+# waymo-open-dataset          # 仅 Waymo 数据集评估，需与 tensorflow 版本配对

@@ -1,0 +1,141 @@
+DATASET: 'KittiDataset'
+DATA_PATH: 'data/kitti'
+
+POINT_CLOUD_RANGE: [0, -40, -3, 70.4, 40, 1]
+
+DATA_SPLIT: {
+    'train': train,
+    'test': val
+}
+
+INFO_PATH: {
+    'train': [kitti_infos_train.pkl],
+    'test': [kitti_infos_val.pkl],
+}
+
+GET_ITEM_LIST: ["points"]
+FOV_POINTS_ONLY: True
+
+# 与 kitti_dataset.yaml 完全一致（基线专用，本文件不修改原文件）
+DATA_AUGMENTOR:
+    DISABLE_AUG_LIST: ['placeholder']
+    AUG_CONFIG_LIST:
+        - NAME: gt_sampling
+          USE_ROAD_PLANE: True
+          DB_INFO_PATH:
+              - kitti_dbinfos_train.pkl
+          PREPARE: {
+             filter_by_min_points: ['Car:5', 'Pedestrian:5', 'Cyclist:5'],
+             filter_by_difficulty: [-1],
+          }
+
+          SAMPLE_GROUPS: ['Car:20','Pedestrian:15', 'Cyclist:15']
+          NUM_POINT_FEATURES: 4
+          DATABASE_WITH_FAKELIDAR: False
+          REMOVE_EXTRA_WIDTH: [0.0, 0.0, 0.0]
+          LIMIT_WHOLE_SCENE: True
+
+        - NAME: random_world_flip
+          ALONG_AXIS_LIST: ['x']
+
+        - NAME: random_world_rotation
+          WORLD_ROT_ANGLE: [-0.78539816, 0.78539816]
+
+        - NAME: random_world_scaling
+          WORLD_SCALE_RANGE: [0.95, 1.05]
+
+
+POINT_FEATURE_ENCODING: {
+    encoding_type: absolute_coordinates_encoding,
+    used_feature_list: ['x', 'y', 'z', 'intensity'],
+    src_feature_list: ['x', 'y', 'z', 'intensity'],
+}
+
+
+DATA_PROCESSOR:
+    - NAME: mask_points_and_boxes_outside_range
+      REMOVE_OUTSIDE_BOXES: True
+
+    - NAME: shuffle_points
+      SHUFFLE_ENABLED: {
+        'train': True,
+        'test': False
+      }
+
+    # ① 稠密点云体素化 —— 教师分支的输入（与基线完全相同的参数）
+    - NAME: transform_points_to_voxels
+      VOXEL_SIZE: [0.05, 0.05, 0.1]
+      MAX_POINTS_PER_VOXEL: 5
+      MAX_NUMBER_OF_VOXELS: {
+        'train': 16000,
+        'test': 40000
+      }
+
+    # ② 创新点③ EIP-BS：由同一帧稠密点云降线束得到学生分支输入，
+    #    产物 points_kd / voxels_kd / voxel_coords_kd / voxel_num_points_kd
+    #    必须排在 transform_points_to_voxels 之后。
+    #    策略实测（200 帧真实 KITTI）见 docs/SDR-理论-实现对照与优化.md 第 2 节。
+    - NAME: eip_bs_voxelize
+      ENABLED: True
+      MODE: importance              # importance / uniform_beam（对照）/ random（对照）
+      SRC_BEAMS: 64                 # KITTI Velodyne HDL-64E
+      DST_BEAMS: 16
+      STAGES: [64, 48, 32, 16]      # 渐进丢线阶段
+      W_CURVATURE: 0.4              # 曲率（边缘）权重
+      W_DENSITY: 0.3                # 密度反向（稀疏保护）权重
+      W_CLASS: 0                       # 类别先验（行人/骑行者）权重
+                                    # 默认 0：训练/测试同分布。类别项依赖 GT 框，训练期有、
+                                    # 测试期没有，实测同等预算下训练期车体点保留 0.99、
+                                    # 测试期 0.35 —— 训练比测试"更容易"，val AP 会虚高。
+                                    # 若想用它必须在论文里写成"训练期 GT 引导的采样式增广"，
+                                    # 并保证所有对比组用同一套（见文档 5.5 第 2 条）。
+      # Car-only 口径：本仓库 CLASS_NAMES=['Car']，所有 GT 的 label 都是 1，
+      # 因此只会取到下面列表的第 1 项。原来写 [0.6, 1.0, 1.0] 时，W_CLASS=0.3 的
+      # 实际有效权重只有 0.3×0.6=0.18，和文档写的 0.3 对不上，别人也复现不出来。
+      # 做 Car-only 实验时请显式写成 [1.0]；做 KITTI 3 类（Car/Ped/Cyclist）时
+      # 用 [0.6, 1.0, 1.0]（车体点本来就多，先验不需要给满）。
+      CLASS_PRIORITY: [1.0]         # 与 CLASS_NAMES 对齐的类别先验
+      # ★ 等点数预算：真 16 线只有 16/64 = 25% 的点，原实现保留 43%，
+      #   多出的 1.7 倍数据足以解释掉全部增益。设 0.25 后两组只差"选哪些点"。
+      TARGET_KEEP_RATIO: 0.25
+      # 预算怎么花：False = 全局按重要性（前景保留最好，但仰角结构被打破，
+      #             不能再用"模拟 16 线雷达"来描述）；
+      #             True  = 保住"哪 16 条线束"（近似真雷达，覆盖率明显更低）
+      ALIGN_KEEP_STRUCTURE: False
+      # 是否分层丢线（每组仰角只留最好的 1 条）。实测在等预算下有害：
+      # 它强制保留"没东西可保"的线束，把别的车牺牲掉。只有"16 线保真"口径才开。
+      STRATIFIED: False
+      # 下面两项只在**没设** TARGET_KEEP_RATIO 时决定保留率（原版口径：43%）
+      KEEP_RATIO_PER_DROP: 0.2      # 被丢线束内的高分点救援比例
+      MIN_RESCUE_PER_BEAM: 1        # 每条被丢线束至少救援几个点
+      # 线束重要性统计方式：mean（文档原式）/ top / topk / max / count。
+      # 等预算 + 无 GT（测试期）时 topk≈max 明显优于 mean（车≥50% 覆盖 0.35 vs 0.30），
+      # 有 GT 时四者基本持平。mean 的问题是被整圈地面点稀释（见审计报告 §1.1）。
+      BEAM_SCORE: topk
+      BEAM_TOP_K: 16                # topk 口径：线束内最高 k 个点的均值（绝对数，
+                                    # 与线束点数无关，消除尺寸偏置）
+      BEAM_TOP_RATIO: 0.1           # top 口径的百分比（BEAM_SCORE: top 时生效）
+      BEAM_SCORE_THRESH: 0.6        # count 口径的阈值（BEAM_SCORE: count 时生效）
+      # 测试期（val/test）是否仍允许采样器读 GT 框。默认 false：KITTI val 带标注，
+      # 若沿用"用 GT 挑点"会让 val AP 虚高（训练用标注、测试没有）。消融想看上限才设 true。
+      USE_GT_IN_TEST: false
+      # 是否记录耗时 / 前景保留率，写入 batch_dict['eipbs_stats'] 与 [SDR] 日志。
+      # 关掉可省约 1 次旋转框包含判定，但要失去 5.4 的 eipbs_* 三个数。
+      LOG_STATS: true
+      NEAR_MARGIN: 0.5              # GT 框外扩"附近"区域宽度（米）
+      CURVATURE_K: 8                # kNN 曲率近邻数
+      CURVATURE_CELL_SIZE: 0.5      # 邻域搜索加速网格（米）
+      DENSITY_RADIUS: 1.0           # 密度统计半径（米）
+      USE_NUMBA: False              # True=逐点 kNN 曲率（原版精度，单帧 2.5s，只能离线）
+                                    # False=网格协方差近似（全向量化，约 60~90ms/帧）
+      SEED: 0
+      # 真实点数：voxel_num_points 会被下面 MAX_POINTS_PER_VOXEL 截断，
+      # MS-DGE 的 log(点数) 先验与点数加权池化需要真实值，故额外存一列。
+      SAVE_TRUE_COUNTS: True
+      # 学生分支单独设 8（稠密分支仍是 5）：体素内参与 PFN 最大池化的点更多，
+      # 描述子更稳；密度先验用的是 SAVE_TRUE_COUNTS 的真实点数，不受此截断影响。
+      MAX_POINTS_PER_VOXEL: 8
+      MAX_NUMBER_OF_VOXELS: {
+        'train': 16000,
+        'test': 40000
+      }

@@ -1,0 +1,113 @@
+# =============================================================================
+#  纯稀疏基线（对照实验 #1）—— 数据集配置
+#
+#  目的：回答"增益是不是只是多拿了点云"这个必答题。
+#  做法：用**均匀抽线**把稠密点云降到与 EIP-BS **完全相同的点数**（25%），
+#        再把结果写回主键，于是未经改动的 Voxel R-CNN 就在同样密度的输入上训练。
+#        两组之间唯一的自变量变成"保住了哪些点"。
+#
+#  与 kitti_dataset_sdr.yaml 的差别只有 DATA_PROCESSOR 里 eip_bs 的三项：
+#      MODE: uniform_beam      # 均匀每 4 条线束留 1 条，不看任何重要性
+#      TARGET_KEEP_RATIO: 0.25 # 强制保留 25% 的点（= 16/64）
+#      WRITE_TO_MAIN: True     # 稀疏结果写回 points/voxels 主键
+#  其余（体素大小、增强、点云范围）与基线完全一致。
+#
+#  注：本文件刻意写成**自包含**（不通过 _BASE_CONFIG_ 继承 kitti_dataset.yaml），
+#      因为 OpenPCDet 的 merge_new_config 只解析一层 _BASE_CONFIG_，嵌套两层时
+#      第二层会被静默忽略 —— 这是踩过的坑，别"优化"回去。
+# =============================================================================
+
+DATASET: 'KittiDataset'
+DATA_PATH: 'data/kitti'
+
+POINT_CLOUD_RANGE: [0, -40, -3, 70.4, 40, 1]
+
+DATA_SPLIT: {
+    'train': train,
+    'test': val
+}
+
+INFO_PATH: {
+    'train': [kitti_infos_train.pkl],
+    'test': [kitti_infos_val.pkl],
+}
+
+GET_ITEM_LIST: ["points"]
+FOV_POINTS_ONLY: True
+
+# ★ 必须与基线 / sdr 用**完全相同的 Car-only 增强**：
+#   本仓库 CLASS_NAMES=['Car']，若这里沿用 kitti_dataset.yaml 的三类采样组
+#   （Car:20 / Ped:15 / Cyc:15 + LIMIT_WHOLE_SCENE=True），贴进来的车比另两组
+#   多 5 个（20 vs 15），"sparse 与 sdr 只差保住了哪些点"这个前提就不成立了。
+DATA_AUGMENTOR:
+    DISABLE_AUG_LIST: ['placeholder']
+    AUG_CONFIG_LIST:
+        - NAME: gt_sampling
+          USE_ROAD_PLANE: True
+          DB_INFO_PATH:
+              - kitti_dbinfos_train.pkl
+          PREPARE: {
+             filter_by_min_points: ['Car:5'],
+             filter_by_difficulty: [-1],
+          }
+
+          SAMPLE_GROUPS: ['Car:15']
+          NUM_POINT_FEATURES: 4
+          DATABASE_WITH_FAKELIDAR: False
+          REMOVE_EXTRA_WIDTH: [0.0, 0.0, 0.0]
+          LIMIT_WHOLE_SCENE: False
+
+        - NAME: random_world_flip
+          ALONG_AXIS_LIST: ['x']
+
+        - NAME: random_world_rotation
+          WORLD_ROT_ANGLE: [-0.78539816, 0.78539816]
+
+        - NAME: random_world_scaling
+          WORLD_SCALE_RANGE: [0.95, 1.05]
+
+POINT_FEATURE_ENCODING: {
+    encoding_type: absolute_coordinates_encoding,
+    used_feature_list: ['x', 'y', 'z', 'intensity'],
+    src_feature_list: ['x', 'y', 'z', 'intensity'],
+}
+
+DATA_PROCESSOR:
+    - NAME: mask_points_and_boxes_outside_range
+      REMOVE_OUTSIDE_BOXES: True
+
+    - NAME: shuffle_points
+      SHUFFLE_ENABLED: {
+        'train': True,
+        'test': False
+      }
+
+    # 先照常体素化：eip_bs_voxelize 需要它算好的 voxel_size
+    - NAME: transform_points_to_voxels
+      VOXEL_SIZE: [0.05, 0.05, 0.1]
+      MAX_POINTS_PER_VOXEL: 5
+      MAX_NUMBER_OF_VOXELS: {
+        'train': 16000,
+        'test': 40000
+      }
+
+    # 均匀抽线 + 等点数对齐 + 写回主键
+    - NAME: eip_bs_voxelize
+      ENABLED: True
+      MODE: uniform_beam            # 对照组：不看任何重要性，均匀每 4 条留 1 条
+      SRC_BEAMS: 64
+      DST_BEAMS: 16
+      TARGET_KEEP_RATIO: 0.25       # 与 EIP-BS 严格等点数（各 25%）
+      WRITE_TO_MAIN: True           # 让**未经改动的基线模型**也吃这份稀疏点云
+      KEEP_RATIO_PER_DROP: 0.0      # 对照组不做救援
+      MIN_RESCUE_PER_BEAM: 0
+      BEAM_SCORE: mean              # 与对照组无关，仅为占位
+      STRATIFIED: False
+      USE_NUMBA: False
+      SEED: 0
+      SAVE_TRUE_COUNTS: True
+      MAX_POINTS_PER_VOXEL: 5
+      MAX_NUMBER_OF_VOXELS: {
+        'train': 16000,
+        'test': 40000
+      }

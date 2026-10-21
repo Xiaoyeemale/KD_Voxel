@@ -1,0 +1,14 @@
+# =============================================================================
+#  纯稀疏基线 —— 模型配置（对照实验 #1）
+#
+#  这就是**原封不动的 Voxel R-CNN**（MODEL 段全部继承 voxel_rcnn_car.yaml，
+#  一个参数都没改），唯一区别是输入点云被均匀抽线到 25%（= 16/64 线）。
+#  用来把"我们的增益"与"只是数据变少了"分开。
+#
+#  训练：python tools/train.py --preset sparse
+# =============================================================================
+
+_BASE_CONFIG_: cfgs/kitti_models/voxel_rcnn_car.yaml
+
+DATA_CONFIG:
+    _BASE_CONFIG_: cfgs/dataset_configs/kitti_dataset_sparse.yaml
